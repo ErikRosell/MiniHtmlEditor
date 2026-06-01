@@ -271,7 +271,8 @@ function serialise(node, isRoot) {
       if (['img','hr','input'].includes(tag)) {
         out += `<${tag}${attrs}>`;
       } else {
-        if (!inner && tag !== 'li') continue;
+        // Keep empty <p> (intentional spacers) and <li>; drop other empty elements
+        if (!inner && tag !== 'li' && tag !== 'p') continue;
         out += `<${tag}${attrs}>${inner}</${tag}>`;
       }
     }
@@ -414,7 +415,7 @@ function ins(ev, type) {
     case 'p':
       html = '<p style="margin:0 0 12px 0;">Nytt stycke</p>'; break;
     case 'spacer':
-      html = '<div style="margin:0 0 16px 0;"></div>'; break;
+      html = '<p style="margin:0 0 16px 0;"></p>'; break;
     case 'h':
       html = '<div style="margin:0 0 6px 0;font-size:16px;font-weight:600;color:var(--muBlue);">Rubrik</div>'; break;
     case 'ul':
@@ -481,9 +482,13 @@ editor.addEventListener('keydown', ev => {
   p.setAttribute('style', marginStyle);
   p.innerHTML = '<br>';
 
-  const block = nearestBlock(node);
-  if (block && block !== editor) {
-    block.parentNode.insertBefore(p, block.nextSibling);
+  // Walk up to the direct child of editor so the new <p> lands at the root level
+  let topBlock = node;
+  while (topBlock && topBlock.parentNode && topBlock.parentNode !== editor) {
+    topBlock = topBlock.parentNode;
+  }
+  if (topBlock && topBlock !== editor && topBlock.parentNode === editor) {
+    editor.insertBefore(p, topBlock.nextSibling);
   } else {
     editor.appendChild(p);
   }
@@ -543,13 +548,17 @@ function mergeStyles(base, extra) {
 
 function removeStyle(ev) {
   ev.preventDefault();
+  editor.focus();
+  // Remove inline formatting (b, i, u, span style) from selection
+  document.execCommand('removeFormat', false, null);
+  // Also strip inline style from the enclosing block element
   const sel = window.getSelection();
-  if (!sel || sel.rangeCount === 0) return;
-  const range = sel.getRangeAt(0);
-  let node = range.commonAncestorContainer;
-  if (node.nodeType === 3) node = node.parentNode;
-  const block = nearestBlock(node);
-  if (block && block !== editor) block.removeAttribute('style');
+  if (sel && sel.rangeCount > 0) {
+    let node = sel.getRangeAt(0).commonAncestorContainer;
+    if (node.nodeType === 3) node = node.parentNode;
+    const block = nearestBlock(node);
+    if (block && block !== editor) block.removeAttribute('style');
+  }
   update();
 }
 

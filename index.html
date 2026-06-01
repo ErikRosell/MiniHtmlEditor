@@ -223,24 +223,48 @@ const DEFAULT_STYLES = [
 ];
 
 // ── Serialise compact HTML ─────────────────────────────────
+function normaliseStyle(css) {
+  // Remove spaces around : and ; and collapse duplicates
+  return css
+    .split(';')
+    .map(r => {
+      const idx = r.indexOf(':');
+      if (idx < 0) return '';
+      const k = r.slice(0, idx).trim();
+      const v = r.slice(idx + 1).trim();
+      return (k && v) ? `${k}:${v}` : '';
+    })
+    .filter(Boolean)
+    .join(';');
+}
+
 function serialise(node) {
   let out = '';
   for (const ch of node.childNodes) {
     if (ch.nodeType === 3) {
-      const t = ch.textContent;
-      if (t) out += t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      // Skip whitespace-only text nodes; collapse internal whitespace
+      const t = ch.textContent.replace(/[\r\n\t]+/g, ' ').replace(/ {2,}/g, ' ');
+      const trimmed = t.trim();
+      if (!trimmed) continue;
+      out += t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     } else if (ch.nodeType === 1) {
       const tag = ch.tagName.toLowerCase();
       if (tag === 'br') continue;
       let attrs = '';
       for (const a of ch.attributes) {
         if (a.name === 'contenteditable') continue;
-        attrs += ` ${a.name}="${a.value.replace(/"/g,'&quot;')}"`;
+        const val = a.name === 'style'
+          ? normaliseStyle(a.value)
+          : a.value;
+        if (a.name === 'style' && !val) continue; // drop empty style attrs
+        attrs += ` ${a.name}="${val.replace(/"/g,'&quot;')}"`;
       }
       const inner = serialise(ch);
       if (['img','hr','input'].includes(tag)) {
         out += `<${tag}${attrs}>`;
       } else {
+        // Skip completely empty elements (no text, no meaningful children)
+        if (!inner && tag !== 'li') continue;
         out += `<${tag}${attrs}>${inner}</${tag}>`;
       }
     }

@@ -118,6 +118,7 @@ body{font-family:system-ui,sans-serif;font-size:13px;background:#e8eaed;color:#3
   <button class="tb" onmousedown="ins(event,'ol')" title="Numrerad lista">1. Lista</button>
   <button class="tb" onmousedown="ins(event,'box')" title="Info-ruta med rubrik">⬜ Box</button>
   <button class="tb" onmousedown="ins(event,'section')" title="Sektion med rubrik + lista">📋 Sektion</button>
+  <button class="tb" onmousedown="ins(event,'table')" title="Infoga tabell">⊞ Tabell</button>
   <div class="sep"></div>
   <button class="tb" onmousedown="doRemoveFormat(event)" title="Rensa all formatering från markering och block">✕ Formatering</button>
   <button class="tb warn" onclick="pasteWordDialog()" title="Klistra in och rensa Word/Office-HTML">📋 Word-HTML</button>
@@ -432,8 +433,8 @@ function doRemoveFormat(ev) {
 function ins(ev, type) {
   ev.preventDefault();
   editor.focus();
-  const sel   = window.getSelection();
-  const range = sel && sel.rangeCount ? sel.getRangeAt(0) : null;
+
+  if (type === 'table') { insTable(); return; }
 
   let html = '';
   switch (type) {
@@ -446,30 +447,84 @@ function ins(ev, type) {
     case 'section': html = '<div style="margin:0 0 14px 0;"><div style="margin:0 0 6px 0;font-size:16px;font-weight:600;color:var(--muBlue);">Rubrik</div><ul style="margin:0;padding-left:20px;"><li style="margin:0 0 6px 0;">Punkt 1</li><li style="margin:0 0 6px 0;">Punkt 2</li><li style="margin:0;">Punkt 3</li></ul></div>'; break;
   }
 
-  insertAtCaret(html, range);
+  // Always insert block elements AFTER the current top-level editor child,
+  // never nested inside an existing element (avoids invalid HTML like <p><p>)
+  insertAfterTopBlock(html);
   update();
 }
 
-function insertAtCaret(html, range) {
-  if (range) {
-    range.collapse(false);
-    const frag = document.createRange().createContextualFragment(html);
-    const last = frag.lastChild;
-    range.insertNode(frag);
-    if (last) {
-      const r2 = document.createRange();
-      r2.setStartAfter(last);
-      r2.collapse(true);
-      const sel = window.getSelection();
-      sel.removeAllRanges();
-      sel.addRange(r2);
-    }
+// Find direct child of editor containing the cursor, insert new element after it
+function insertAfterTopBlock(html) {
+  const sel = window.getSelection();
+  let anchor = null;
+  if (sel && sel.rangeCount > 0) {
+    let n = sel.getRangeAt(0).commonAncestorContainer;
+    if (n.nodeType === 3) n = n.parentNode;
+    while (n && n.parentNode && n.parentNode !== editor) n = n.parentNode;
+    if (n && n !== editor && n.parentNode === editor) anchor = n;
+  }
+
+  const frag = document.createRange().createContextualFragment(html);
+  const last = frag.lastChild;
+  if (anchor) {
+    editor.insertBefore(frag, anchor.nextSibling);
   } else {
-    editor.insertAdjacentHTML('beforeend', html);
+    editor.appendChild(frag);
+  }
+
+  // Move cursor inside the new element
+  if (last) {
+    const r2 = document.createRange();
+    // Find first text node or set to start of element
+    const firstText = firstTextNode(last);
+    if (firstText) {
+      r2.setStart(firstText, 0);
+    } else {
+      r2.setStart(last, 0);
+    }
+    r2.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(r2);
+    savedRange = r2.cloneRange();
   }
 }
 
-// ── Enter key: new <p> at editor root level ───────────────
+function firstTextNode(el) {
+  if (el.nodeType === 3) return el;
+  for (const ch of el.childNodes) {
+    const t = firstTextNode(ch);
+    if (t) return t;
+  }
+  return null;
+}
+
+// ── Table insertion ───────────────────────────────────────
+function insTable() {
+  const rows = parseInt(prompt('Antal rader (inkl. rubrikrad):', '3'), 10);
+  if (!rows || rows < 1) return;
+  const cols = parseInt(prompt('Antal kolumner:', '3'), 10);
+  if (!cols || cols < 1) return;
+
+  const cellStyle = 'border:1px solid #ccc;padding:6px 8px;';
+  const thStyle   = cellStyle + 'background:#f0f0f0;font-weight:600;text-align:left;';
+
+  let thead = '<tr>';
+  for (let c = 0; c < cols; c++) thead += `<th style="${thStyle}">Kolumn ${c+1}</th>`;
+  thead += '</tr>';
+
+  let tbody = '';
+  for (let r = 1; r < rows; r++) {
+    tbody += '<tr>';
+    for (let c = 0; c < cols; c++) tbody += `<td style="${cellStyle}">Cell</td>`;
+    tbody += '</tr>';
+  }
+
+  const html = `<table style="border-collapse:collapse;width:100%;margin:0 0 14px 0;">${thead}${tbody}</table>`;
+  insertAfterTopBlock(html);
+  update();
+}
+
+// ── Enter key: split block at cursor ─────────────────────
 editor.addEventListener('keydown', ev => {
   if (ev.key !== 'Enter' || ev.shiftKey) return;
 
@@ -479,7 +534,7 @@ editor.addEventListener('keydown', ev => {
   let node = range.commonAncestorContainer;
   if (node.nodeType === 3) node = node.parentNode;
 
-  // Let browser handle lists
+  // Let browser handle list items
   let check = node;
   while (check && check !== editor) {
     if (['LI','UL','OL'].includes(check.tagName)) return;
@@ -488,31 +543,57 @@ editor.addEventListener('keydown', ev => {
 
   ev.preventDefault();
 
-  // Inherit <p> margin style from current paragraph if inside one
-  let pStyle = 'margin:0 0 12px 0;';
-  let ancestor = node;
-  while (ancestor && ancestor !== editor) {
-    if (ancestor.tagName === 'P') { pStyle = ancestor.getAttribute('style') || pStyle; break; }
-    ancestor = ancestor.parentNode;
-  }
+  // Delete any selected text first
+  if (!range.collapsed) range.deleteContents();
 
-  const p = document.createElement('p');
-  p.setAttribute('style', pStyle);
-  // p stays empty; CSS rule #editor p:empty::before adds placeholder
-
-  // Insert after top-level block (direct child of editor)
+  // Find top-level block (direct child of editor)
   let topBlock = node;
   while (topBlock && topBlock.parentNode && topBlock.parentNode !== editor) {
     topBlock = topBlock.parentNode;
   }
-  if (topBlock && topBlock !== editor && topBlock.parentNode === editor) {
-    editor.insertBefore(p, topBlock.nextSibling);
-  } else {
+  if (!topBlock || topBlock === editor || topBlock.parentNode !== editor) {
+    // Fallback: append empty p
+    const p = document.createElement('p');
+    p.setAttribute('style', 'margin:0 0 12px 0;');
     editor.appendChild(p);
+    const r2 = document.createRange();
+    r2.setStart(p, 0); r2.collapse(true);
+    sel.removeAllRanges(); sel.addRange(r2);
+    savedRange = r2.cloneRange();
+    update(); schedSave();
+    return;
   }
 
+  // Inherit style from current top-level block if it's a <p>
+  let pStyle = 'margin:0 0 12px 0;';
+  if (topBlock.tagName === 'P') pStyle = topBlock.getAttribute('style') || pStyle;
+
+  // Create new <p> that will hold content AFTER the cursor
+  const newP = document.createElement('p');
+  newP.setAttribute('style', pStyle);
+
+  // Build a range from cursor to end of topBlock, extract that content
+  const afterRange = document.createRange();
+  afterRange.setStart(range.startContainer, range.startOffset);
+  afterRange.setEnd(topBlock, topBlock.childNodes.length);
+  const afterFrag = afterRange.extractContents();
+
+  // If there's any non-whitespace content after cursor, put it in new <p>
+  if (afterFrag.textContent.trim() || afterFrag.childNodes.length > 0) {
+    newP.appendChild(afterFrag);
+  }
+
+  // Insert new <p> after topBlock
+  editor.insertBefore(newP, topBlock.nextSibling);
+
+  // Move cursor to start of new <p>
   const r2 = document.createRange();
-  r2.setStart(p, 0);
+  const firstT = firstTextNode(newP);
+  if (firstT) {
+    r2.setStart(firstT, 0);
+  } else {
+    r2.setStart(newP, 0);
+  }
   r2.collapse(true);
   sel.removeAllRanges();
   sel.addRange(r2);
@@ -574,7 +655,7 @@ function serialise(node, isRoot) {
       if (['img','hr','input'].includes(tag)) {
         out += `<${tag}${attrs}>`;
       } else {
-        if (!inner && tag !== 'li' && tag !== 'p') continue;
+        if (!inner && tag !== 'li' && tag !== 'p' && tag !== 'td' && tag !== 'th') continue;
         out += `<${tag}${attrs}>${inner}</${tag}>`;
       }
     }

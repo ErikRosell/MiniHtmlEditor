@@ -70,7 +70,7 @@ button{cursor:pointer}
 #editor img{max-width:100%}
 #editor.show-blocks p,#editor.show-blocks div,#editor.show-blocks li,#editor.show-blocks ul,#editor.show-blocks ol,#editor.show-blocks td,#editor.show-blocks th,#editor.show-blocks h1,#editor.show-blocks h2,#editor.show-blocks h3,#editor.show-blocks h4{outline:1px dashed rgba(26,111,219,.45);outline-offset:-1px}
 #editor.show-blocks div:has(>p,>div,>ul,>ol,>table){outline:1px dashed rgba(220,120,0,.75)}
-#editor.trim-last div:not(#editor)>:last-child,#editor.trim-last li:last-child{margin-bottom:0!important}
+#editor.trim-last div:not(#editor)>:last-child:not([data-mb]),#editor.trim-last li:last-child:not([data-mb]){margin-bottom:0!important}
 #insp-hl{position:absolute;pointer-events:none;border:2px solid rgba(26,111,219,.55);border-radius:3px;background:rgba(26,111,219,.05)}
 
 /* Inspector */
@@ -296,7 +296,7 @@ const isText = n => !!n && n.nodeType === 3;
 const indexOf = n => Array.prototype.indexOf.call(n.parentNode.childNodes, n);
 const uid = () => 's' + Math.random().toString(36).slice(2, 10);
 const escHtml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-const escAttr = s => escHtml(s).replace(/"/g, '&quot;');
+const escAttr = s => escHtml(String(s).replace(/[\r\n\t]+/g, ' ')).replace(/"/g, '&quot;');
 const clone = o => JSON.parse(JSON.stringify(o));
 const WS_ONLY = /^[ \t\n\r]*$/;
 
@@ -515,9 +515,30 @@ function presetElement(id, fallbackTag) {
 }
 const getStyle = el => parseCss(el.getAttribute('style') || '');
 function setStyle(el, m) { el.setAttribute('style', styleString(m)); }
+/* Index of the first block child (a list item's sub list); text before it is the block's own line. */
 function inlineEndIndex(B) { let i = 0; for (const c of B.childNodes) { if (isBlockEl(c)) return i; i++; } return B.childNodes.length; }
-function stripTrailingBr(el) { const l = el.lastChild; if (isEl(l) && l.tagName === 'BR') l.remove(); }
-function ensureNotEmpty(el) { if (!hasContent(el) && !el.querySelector('br,ul,ol,table')) { el.textContent = ''; el.appendChild(document.createElement('br')); } }
+function inlineHasContent(B) {
+  const end = inlineEndIndex(B);
+  for (let i = 0; i < end; i++) {
+    const c = B.childNodes[i];
+    if (isText(c) ? !WS_ONLY.test(c.data) : isEl(c) && (c.tagName === 'IMG' || (c.tagName !== 'BR' && hasContent(c)))) return true;
+  }
+  return false;
+}
+function stripTrailingBr(el) { const l = el.childNodes[inlineEndIndex(el) - 1]; if (isEl(l) && l.tagName === 'BR') l.remove(); }
+function clearInlinePart(el) { const end = inlineEndIndex(el); for (let i = end - 1; i >= 0; i--) el.childNodes[i].remove(); }
+function ensureNotEmpty(el) {
+  if (el.tagName === 'LI' && hasBlockChild(el)) {        // item with a sub list keeps a visible first line
+    const end = inlineEndIndex(el);
+    let line = false;
+    for (let i = 0; i < end && !line; i++) { const c = el.childNodes[i]; line = isText(c) ? !WS_ONLY.test(c.data) : isEl(c) && (c.tagName === 'BR' || c.tagName === 'IMG' || hasContent(c) || !!c.querySelector('br')); }
+    if (!line) { clearInlinePart(el); el.insertBefore(document.createElement('br'), el.firstChild); }
+    return;
+  }
+  if (!hasContent(el) && !el.querySelector('br,ul,ol,table')) { el.textContent = ''; el.appendChild(document.createElement('br')); }
+}
+/* A formatting element with no text at all. One that holds only a space is kept – removing it would join words. */
+const isEmptyInline = x => x.textContent === '' && !x.querySelector('br,img');
 
 /* ---------- selection ---------- */
 let lastRange = null;
@@ -536,7 +557,20 @@ function firstCaretPos(el) {
   let n;
   while ((n = w.nextNode())) {
     if (isText(n)) { if (n.length) return { node: n, offset: 0 }; continue; }
+    if (el.tagName === 'LI' && n.parentNode === el && (n.tagName === 'UL' || n.tagName === 'OL')) return { node: el, offset: indexOf(n) };
     if (n.tagName === 'BR' || n.tagName === 'IMG' || n.tagName === 'HR') return { node: n.parentNode, offset: indexOf(n) };
+  }
+  return { node: el, offset: 0 };
+}
+/* Caret position at the end of a block's own line (before a list item's sub list). */
+function inlineLastPos(el) {
+  const end = inlineEndIndex(el);
+  for (let i = end - 1; i >= 0; i--) {
+    const c = el.childNodes[i];
+    if (isText(c)) { if (c.length) return { node: c, offset: c.length }; continue; }
+    if (!isEl(c)) continue;
+    if (c.tagName === 'BR' || c.tagName === 'IMG') return { node: el, offset: i + 1 };
+    const lt = lastTextDeep(c); if (lt) return { node: lt, offset: lt.length };
   }
   return { node: el, offset: 0 };
 }
@@ -607,21 +641,6 @@ function isAtBlockEnd(B, node, off) {
   const i = fragInfo(rangeFrag(node, off, B, end)); return !i.text && !i.obj && i.br <= 1;
 }
 function spansBlocks(r) { return closestTextBlock(r.startContainer) !== closestTextBlock(r.endContainer); }
-function nodePath(n) { const p = []; while (n && n !== editor) { if (!n.parentNode) return null; p.unshift(indexOf(n)); n = n.parentNode; } return n === editor ? p : null; }
-function fromPath(p) { let n = editor; for (const i of p) { if (!n.childNodes[i]) return null; n = n.childNodes[i]; } return n; }
-function selPath() {
-  const r = getRange(); if (!r) return null;
-  const s = nodePath(r.startContainer), e = nodePath(r.endContainer);
-  return s && e ? { s, so: r.startOffset, e, eo: r.endOffset } : null;
-}
-function restoreSelPath(sp) {
-  editor.focus({ preventScroll: true });
-  if (sp) {
-    const s = fromPath(sp.s), e = fromPath(sp.e);
-    if (s && e && validPoint(s, sp.so) && validPoint(e, sp.eo)) { setSel(s, sp.so, e, sp.eo); return; }
-  }
-  const b = lastTextBlockIn(editor); if (b) caretToEnd(b);
-}
 /* Raw-reference selection, survives moving nodes (not cloning). */
 function saveSel() {
   const r = getRange() || (lastRange && validPoint(lastRange.startContainer, lastRange.startOffset) ? lastRange : null);
@@ -635,7 +654,14 @@ function restoreSel(s) {
   if (validPoint(sc, s.so) && validPoint(ec, s.eo)) { try { setSel(sc, s.so, ec, s.eo); return; } catch (e) { /* fall through */ } }
   if (s.ti) setTextIndex(s.ti);
 }
-function countUnits(n) { let c = 0; for (const ch of n.childNodes) { if (isText(ch)) c += ch.data.length; else if (isEl(ch)) c += ch.tagName === 'BR' ? 1 : countUnits(ch); } return c; }
+function countUnits(n) {
+  let c = 0;
+  for (const ch of n.childNodes) {
+    if (isText(ch)) c += ch.data.length;
+    else if (isEl(ch)) { if (ch.tagName === 'BR') c += 1; else { if (BLOCK_TAGS.has(ch.tagName)) c += 1; c += countUnits(ch); } }
+  }
+  return c;
+}
 function pointIndex(node, off) { return countUnits(rangeFrag(editor, 0, node, off)); }
 function textIndexOf(r) { try { return { s: pointIndex(r.startContainer, r.startOffset), e: pointIndex(r.endContainer, r.endOffset) }; } catch (e) { return null; } }
 function indexPoint(idx) {
@@ -645,6 +671,7 @@ function indexPoint(idx) {
   while ((n = w.nextNode())) {
     if (isText(n)) { if (acc + n.length >= idx) return { node: n, offset: idx - acc }; acc += n.length; lastText = n; }
     else if (n.tagName === 'BR') { if (acc === idx) return { node: n.parentNode, offset: indexOf(n) }; acc += 1; }
+    else if (BLOCK_TAGS.has(n.tagName)) { acc += 1; if (acc === idx && !n.firstChild) return { node: n, offset: 0 }; }
   }
   return lastText ? { node: lastText, offset: lastText.length } : { node: editor, offset: editor.childNodes.length };
 }
@@ -700,12 +727,13 @@ function normBlock(el, mark) {
 }
 function normTextBlock(el, mark) {
   normInline(el, mark);
-  const l = el.lastChild;
+  const l = el.childNodes[inlineEndIndex(el) - 1];      // a single <br> ending the line is only a placeholder
   if (isEl(l) && l.tagName === 'BR') {
     let p = l.previousSibling; while (p && isText(p) && WS_ONLY.test(p.data)) p = p.previousSibling;
     if (p && !(isEl(p) && p.tagName === 'BR')) { l.remove(); mark(); }
   }
-  if (!hasContent(el) && !el.querySelector('br,img,ul,ol,table')) { el.textContent = ''; el.appendChild(document.createElement('br')); mark(); }
+  if (el.tagName === 'LI' && hasBlockChild(el)) { const n = el.childNodes.length; ensureNotEmpty(el); if (n !== el.childNodes.length) mark(); }
+  else if (!hasContent(el) && !el.querySelector('br,img,ul,ol,table')) { el.textContent = ''; el.appendChild(document.createElement('br')); mark(); }
 }
 function fontToSpan(f) {
   const s = document.createElement('span'); s.setAttribute('style', normCss(fontCss(f) + (f.getAttribute('style') || '')));
@@ -746,7 +774,7 @@ function normInline(el, mark) {
     if (x.tagName === 'FONT') { x = fontToSpan(x); mark(); }
     normInline(x, mark);
     if (FORMAT_TAGS.has(x.tagName) || x.tagName === 'A') {
-      if (!hasContent(x) && !x.querySelector('br,img')) { x.remove(); mark(); continue; }
+      if (isEmptyInline(x)) { x.remove(); mark(); continue; }
       if (x.tagName === 'SPAN' && !normCss(x.getAttribute('style') || '') && !x.dataset.preset) { unwrap(x); mark(); continue; }
       if (x.tagName === 'SPAN' && x.childNodes.length === 1 && isEl(x.firstChild) && x.firstChild.tagName === 'SPAN') {
         const inner = x.firstChild;
@@ -820,7 +848,7 @@ const OUT_BLOCKS = new Set(['p', 'div', 'ul', 'ol', 'li', 'table', 'tr', 'th', '
 
 function serializeDoc(opts = {}) {
   const o = {
-    pretty: !!opts.pretty, keepData: !!opts.keepData,
+    pretty: !!opts.pretty, keepData: !!opts.keepData, keepMb: !!opts.keepMb,
     trimLast: opts.trimLast != null ? opts.trimLast : settings.trimLast,
     nbsp: settings.emptyAsNbsp, wrapper: opts.wrapper != null ? opts.wrapper : settings.wrapperOn
   };
@@ -858,15 +886,22 @@ function serContainer(el, o, d, isRoot) {
   }
   return out;
 }
+/* Browsers leave stray non-breaking spaces while typing, so a lone one becomes a normal space –
+   except after a digit ("10&nbsp;000&nbsp;kr"). Runs of spaces stay visible. */
 function serText(t) {
   t = t.replace(/[\t\n\r]+/g, ' ');
-  t = t.replace(/[  ]+/g, m => (m.length === 1 ? ' ' : ' '.repeat(m.length - 1) + ' '));
-  return escHtml(t).replace(/ /g, '&nbsp;');
+  t = t.replace(/[ \u00a0]+/g, (m, i, all) => {
+    if (m.length > 1) return '\u00a0'.repeat(m.length - 1) + ' ';
+    return m === '\u00a0' && /\d/.test(all[i - 1] || '') ? '\u00a0' : ' ';
+  });
+  return escHtml(t).replace(/\u00a0/g, '&nbsp;');
 }
 function tidyInline(s) {
   s = s.replace(/(?<!<br>)<br>((?:<\/[a-z0-9]+>)*)$/, '$1');                 // trailing placeholder <br>
   s = s.replace(/^((?:<(?!br)[a-z][^>]*>)*) +/, '$1').replace(/ +((?:<\/[a-z0-9]+>)*)$/, '$1');
   s = s.replace(/ +<br>/g, '<br>').replace(/<br> +/g, '<br>');
+  let prev;
+  do { prev = s; s = s.replace(/<(b|i|u|s|span|a|sub|sup)\b[^>]*><\/\1>/g, ''); } while (s !== prev);   // <b></b> left by a removed <br>
   return s;
 }
 function serInline(n, o) {
@@ -875,10 +910,14 @@ function serInline(n, o) {
   return '';
 }
 function serTextBlockInner(el, o, d) {
-  let s = '', buf = '';
+  let s = '', buf = '', first = true;
   for (const k of el.childNodes) {
-    if (isEl(k) && BLOCK_TAGS.has(k.tagName)) { s += tidyInline(buf); buf = ''; s += serEl(k, o, d + 1, false); }
-    else buf += serInline(k, o);
+    if (isEl(k) && BLOCK_TAGS.has(k.tagName)) {
+      let line = tidyInline(buf); buf = '';
+      if (first && !line && el.tagName === 'LI' && o.nbsp) line = '&nbsp;';   // empty item above its sub list
+      s += line; first = false;
+      s += serEl(k, o, d + 1, false);
+    } else buf += serInline(k, o);
   }
   s += tidyInline(buf);
   return s;
@@ -894,16 +933,18 @@ function serEl(el, o, d, trimBottom) {
   let css = el.getAttribute('style') || '';
   if (el.tagName === 'FONT') css = fontCss(el) + css;
   const m = parseCss(css);
-  if (trimBottom && OUT_BLOCKS.has(tag) && getMarginSide(m, 2) !== null) setMarginSide(m, 2, '0');
+  if (trimBottom && !el.hasAttribute('data-mb') && OUT_BLOCKS.has(tag) && getMarginSide(m, 2) !== null) setMarginSide(m, 2, '0');
   let attrs = '';
   if (tag === 'a') {
-    const h = el.getAttribute('href'); if (h) attrs += ` href="${escAttr(h)}"`;
+    const h = (el.getAttribute('href') || '').replace(/[\r\n\t]+/g, ''); if (h) attrs += ` href="${escAttr(h)}"`;
     const t = el.getAttribute('target'); if (t) attrs += ` target="${escAttr(t)}"` + (t === '_blank' ? ' rel="noopener"' : '');
   }
   if (tag === 'img') for (const a of ['src', 'alt', 'width', 'height']) { const v = el.getAttribute(a); if (v) attrs += ` ${a}="${escAttr(v)}"`; }
   if (tag === 'td' || tag === 'th') for (const a of ['colspan', 'rowspan']) { const v = el.getAttribute(a); if (v && v !== '1') attrs += ` ${a}="${escAttr(v)}"`; }
+  if (tag === 'ol') for (const a of ['start', 'type']) { const v = el.getAttribute(a); if (v && !(a === 'start' && v === '1')) attrs += ` ${a}="${escAttr(v)}"`; }
   const st = styleString(m); if (st) attrs += ` style="${escAttr(st)}"`;
   if (o.keepData && el.dataset.preset) attrs += ` data-preset="${escAttr(el.dataset.preset)}"`;
+  if ((o.keepData || o.keepMb) && el.hasAttribute('data-mb')) attrs += ' data-mb="1"';
   if (tag === 'br') return '<br>';
   if (tag === 'hr') return nl(o, d) + `<hr${attrs}>`;
   if (tag === 'img') return `<img${attrs}>`;
@@ -925,14 +966,29 @@ function serEl(el, o, d, trimBottom) {
 /* ---------- sanitizer: pasted / imported HTML → editor model ---------- */
 const SAN_DROP = new Set(['SCRIPT', 'STYLE', 'META', 'LINK', 'TITLE', 'HEAD', 'NOSCRIPT', 'TEMPLATE', 'IFRAME', 'OBJECT', 'EMBED', 'SVG', 'MATH', 'CANVAS', 'BUTTON', 'INPUT', 'SELECT', 'OPTION', 'TEXTAREA', 'XML', 'VIDEO', 'AUDIO', 'SOURCE', 'MAP', 'AREA', 'BASE', 'COLGROUP', 'COL', 'CAPTION']);
 const KEEP_TAGS = new Set(['P', 'DIV', 'SPAN', 'B', 'STRONG', 'I', 'EM', 'U', 'S', 'STRIKE', 'DEL', 'INS', 'SUB', 'SUP', 'A', 'BR', 'HR', 'IMG', 'UL', 'OL', 'LI', 'TABLE', 'THEAD', 'TBODY', 'TFOOT', 'TR', 'TD', 'TH', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'FONT']);
-const BULLET_RE = /^[\s ]*([•·▪◦‣○●■□▫➢➤►✓✔◆◇]|[-–—*])[\s ]+/;
-const NUM_RE = /^[\s ]*(\d{1,3})[.)][\s ]+/;
+const BULLET_RE = /^[\s\u00a0]*([•·▪◦‣○●■□▫➢➤►✓✔◆◇]|[-–—*])[\s\u00a0]+/;
+const NUM_RE = /^[\s\u00a0]*(\d{1,3})[.)][\s\u00a0]+/;
 function safeHref(h) {
-  h = String(h || '').trim();
+  h = String(h || '').replace(/[\r\n\t]+/g, '').trim();
   if (!h) return null;
   if (/^(https?:|mailto:|tel:|#|\/|\.\.?\/)/i.test(h)) return h;
   if (/^[a-z][a-z0-9+.-]*:/i.test(h)) return null;   // javascript:, data:, file: …
   return h;
+}
+function copyOlAttrs(src, el) {
+  const st = src.getAttribute('start'), ty = src.getAttribute('type');
+  if (st && /^\d+$/.test(st) && st !== '1') el.setAttribute('start', st);
+  if (ty && /^[aAiI1]$/.test(ty)) el.setAttribute('type', ty);
+}
+/* Numbering from a list marker such as "3.", "b)" or "iv." → start/type on the <ol>. */
+function olAttrsFromMarker(list, marker) {
+  const m = /^\(?(\d+|[a-zA-Z]|[ivxlcdm]+|[IVXLCDM]+)[.)]/.exec(marker || ''); if (!m) return;
+  const v = m[1];
+  if (/^\d+$/.test(v)) { if (+v !== 1) list.setAttribute('start', v); }
+  else if (v === 'i' || (/^[ivxlcdm]+$/.test(v) && v.length > 1)) list.setAttribute('type', 'i');
+  else if (v === 'I' || (/^[IVXLCDM]+$/.test(v) && v.length > 1)) list.setAttribute('type', 'I');
+  else if (/^[a-z]$/.test(v)) { list.setAttribute('type', 'a'); if (v !== 'a') list.setAttribute('start', String(v.charCodeAt(0) - 96)); }
+  else if (/^[A-Z]$/.test(v)) { list.setAttribute('type', 'A'); if (v !== 'A') list.setAttribute('start', String(v.charCodeAt(0) - 64)); }
 }
 const hasBlockChildAny = el => Array.from(el.children).some(c => BLOCK_TAGS.has(c.tagName.toUpperCase()));
 function nextElSibAny(el) { let n = el.nextSibling; while (n && (n.nodeType === 8 || (n.nodeType === 3 && !/\S/.test(n.data)))) n = n.nextSibling; return n; }
@@ -941,6 +997,15 @@ function sanitizeHtml(html, mode) { // mode: 'clean' (foreign: Word, web) | 'kee
   const doc = new DOMParser().parseFromString(String(html), 'text/html');
   const frag = document.createDocumentFragment();
   if (!doc.body) return frag;
+  for (const pre of Array.from(doc.body.querySelectorAll('pre'))) {        // keep the line breaks of <pre>
+    const w = doc.createTreeWalker(pre, NodeFilter.SHOW_TEXT); const texts = []; let t; while ((t = w.nextNode())) texts.push(t);
+    for (const tn of texts) {
+      const parts = tn.data.split(/\r?\n/); if (parts.length < 2) continue;
+      const f = doc.createDocumentFragment();
+      parts.forEach((x, i) => { if (i) f.appendChild(doc.createElement('br')); if (x) f.appendChild(doc.createTextNode(x)); });
+      tn.replaceWith(f);
+    }
+  }
   if (mode === 'clean') { convertWordLists(doc.body); convertTextBullets(doc.body); }
   sanWalk(doc.body, frag, mode);
   postSanitize(frag, mode);
@@ -950,14 +1015,15 @@ function sanWalk(src, dst, mode) {
   for (const n of Array.from(src.childNodes)) {
     if (n.nodeType === 3) {
       let t = n.data;
-      if (mode === 'clean') t = t.replace(/ /g, ' ');
+      if (mode === 'clean') t = t.replace(/\u00a0/g, ' ');
       t = t.replace(/[\t\n\r ]+/g, ' ');
       if (t) dst.appendChild(document.createTextNode(t));
       continue;
     }
     if (n.nodeType !== 1) continue;
     const tag = n.tagName.toUpperCase();
-    if (SAN_DROP.has(tag) || tag.indexOf(':') >= 0) continue;
+    if (SAN_DROP.has(tag)) continue;
+    if (tag.indexOf(':') >= 0) { if (!/^(O|V):/.test(tag)) sanWalk(n, dst, mode); continue; }   // keep text of <st1:place>, <w:sdt> …
     if (mode === 'clean') sanClean(n, tag, dst); else sanKeep(n, tag, dst, mode);
   }
 }
@@ -980,7 +1046,7 @@ function sanClean(n, tag, dst) {
       break;
     case 'H1': el = presetElement('h-main', 'div'); inlineOk = false; break;
     case 'H2': case 'H3': case 'H4': case 'H5': case 'H6': el = presetElement('h-sub', 'div'); inlineOk = false; break;
-    case 'UL': case 'OL': el = makeEl(tag.toLowerCase(), D[tag.toLowerCase()]); inlineOk = false; break;
+    case 'UL': case 'OL': el = makeEl(tag.toLowerCase(), D[tag.toLowerCase()]); if (tag === 'OL') copyOlAttrs(n, el); inlineOk = false; break;
     case 'LI': el = makeEl('li', D.li); break;
     case 'TABLE': el = makeEl('table', D.table); inlineOk = false; break;
     case 'THEAD': case 'TBODY': case 'TFOOT': el = document.createElement(tag.toLowerCase()); inlineOk = false; break;
@@ -1041,7 +1107,9 @@ function sanKeep(n, tag, dst, mode) {
   if (tag === 'A') { el.setAttribute('href', href); if (n.getAttribute('target') === '_blank') el.setAttribute('target', '_blank'); }
   if (tag === 'IMG') for (const a of ['src', 'alt', 'width', 'height']) { const v = n.getAttribute(a); if (v) el.setAttribute(a, v); }
   if (tag === 'TD' || tag === 'TH') for (const a of ['colspan', 'rowspan']) { const v = n.getAttribute(a); if (v && v !== '1') el.setAttribute(a, v); }
+  if (tag === 'OL') copyOlAttrs(n, el);
   if (mode === 'internal' && n.getAttribute('data-preset') && presetById(n.getAttribute('data-preset'))) el.dataset.preset = n.getAttribute('data-preset');
+  if (n.hasAttribute('data-mb')) el.dataset.mb = '1';
   dst.appendChild(el);
   if (tag !== 'BR' && tag !== 'HR' && tag !== 'IMG') sanWalk(n, el, mode);
 }
@@ -1055,13 +1123,16 @@ function flattenInnerBlocks(cell) {
     unwrap(c);
   }
 }
-function groupInlineRuns(parent) {
+function groupInlineRuns(parent, mode) {
   let run = [];
   const flush = () => {
     if (!run.length) return;
     const useful = run.some(n => (isText(n) && !/^[\s]*$/.test(n.data)) || (isEl(n) && n.tagName !== 'BR' && (/\S/.test(n.textContent) || n.querySelector('img') || n.tagName === 'IMG')));
     if (useful) { const p = makeEl('p', settings.defaults.p); run[0].before(p); run.forEach(x => p.appendChild(x)); }
-    else run.forEach(x => x.remove());
+    else {
+      if (mode !== 'clean') run.filter(x => isEl(x) && x.tagName === 'BR').forEach(br => { const p = makeEl('p', 'margin:0;'); p.appendChild(document.createElement('br')); br.before(p); });
+      run.forEach(x => x.remove());
+    }
     run = [];
   };
   for (const n of Array.from(parent.childNodes)) {
@@ -1072,8 +1143,16 @@ function groupInlineRuns(parent) {
 }
 function postSanitize(frag, mode) {
   $$('li,td,th', frag).forEach(flattenInnerBlocks);
-  groupInlineRuns(frag);
-  $$('div', frag).forEach(d => { if (hasBlockChild(d)) groupInlineRuns(d); });
+  let lis = [];                                          // bare <li> elements (e.g. copied list items) → one list
+  const flushLis = () => { if (lis.length) { const ul = makeEl('ul', settings.defaults.ul); lis[0].before(ul); lis.forEach(li => ul.appendChild(li)); } lis = []; };
+  for (const n of Array.from(frag.childNodes)) {
+    if (isEl(n) && n.tagName === 'LI') lis.push(n);
+    else if (isText(n) && WS_ONLY.test(n.data) && lis.length) n.remove();
+    else flushLis();
+  }
+  flushLis();
+  groupInlineRuns(frag, mode);
+  $$('div', frag).forEach(d => { if (hasBlockChild(d)) groupInlineRuns(d, mode); });
   for (const b of $$('p,div,h1,h2,h3,h4,h5,h6', frag)) {
     if (hasBlockChild(b)) continue;
     const empty = !/\S/.test(b.textContent) && !b.querySelector('img');
@@ -1081,7 +1160,7 @@ function postSanitize(frag, mode) {
     if (mode === 'clean') b.remove();
     else { b.textContent = ''; b.appendChild(document.createElement('br')); }
   }
-  for (const x of $$('span,b,i,u,s,a,sub,sup', frag)) { if (!x.isConnected && !frag.contains(x)) continue; if (!/\S/.test(x.textContent) && !x.querySelector('img,br')) x.remove(); }
+  for (const x of $$('span,b,i,u,s,a,sub,sup', frag)) { if (frag.contains(x) && isEmptyInline(x)) x.remove(); }
   $$('ul,ol', frag).forEach(l => { if (!l.querySelector('li')) l.remove(); });
   if (mode === 'clean') $$('li > ul, li > ol', frag).forEach(l => l.setAttribute('style', normCss(settings.defaults.sublist)));
 }
@@ -1111,28 +1190,38 @@ function convertWordLists(root) {
     const style = p.getAttribute('style') || '';
     const m = style.match(/mso-list\s*:\s*l(\d+)\s+level(\d+)(?:\s+lfo(\d+))?/i);
     if (!m && !/MsoListParagraph/i.test(p.getAttribute('class') || '')) continue;
-    const marker = extractWordMarker(p).replace(/ /g, ' ').trim();
-    items.push({ p, level: m ? +m[2] : 1, list: m ? m[1] + '/' + (m[3] || '') : '', ordered: /^\(?([0-9]+|[a-z]|[ivxlcdm]+)[.)]/i.test(marker) });
+    if (!m || /mso-list\s*:\s*none/i.test(style)) { items.push({ p, cont: true }); continue; }   // "List Paragraph" without a bullet
+    const marker = extractWordMarker(p).replace(/\u00a0/g, ' ').trim();
+    items.push({ p, level: +m[2], list: m[1] + '/' + (m[3] || ''), marker, ordered: /^\(?([0-9]+|[a-z]|[ivxlcdm]+)[.)]/i.test(marker) });
   }
   let i = 0;
   while (i < items.length) {
+    if (items[i].cont) { i++; continue; }                  // continuation with no list item before it stays a paragraph
     const run = [items[i]];
     while (i + run.length < items.length) {
       const nx = items[i + run.length];
-      if (nextElSibAny(run[run.length - 1].p) !== nx.p || nx.list !== run[0].list) break;   // a different Word list starts
+      if (nextElSibAny(run[run.length - 1].p) !== nx.p || (!nx.cont && nx.list !== run[0].list)) break;   // a different Word list starts
       run.push(nx);
     }
-    const base = Math.min(...run.map(r => r.level));
+    const levels = run.filter(r => !r.cont).map(r => r.level);
+    const base = Math.min(...levels);
     const rootList = doc.createElement(run[0].ordered ? 'ol' : 'ul');
+    if (run[0].ordered) olAttrsFromMarker(rootList, run[0].marker);
     run[0].p.before(rootList);
     const stack = [{ level: base, list: rootList }];
     for (const it of run) {
+      if (it.cont) {                                        // text belonging to the previous item
+        const li = stack[stack.length - 1].list.lastElementChild;
+        if (li) { li.appendChild(doc.createElement('br')); while (it.p.firstChild) li.appendChild(it.p.firstChild); it.p.remove(); }
+        continue;
+      }
       while (stack.length > 1 && stack[stack.length - 1].level > it.level) stack.pop();
       let top = stack[stack.length - 1];
       if (it.level > top.level) {
         let lastLi = top.list.lastElementChild;
         if (!lastLi) { lastLi = doc.createElement('li'); top.list.appendChild(lastLi); }
         const sub = doc.createElement(it.ordered ? 'ol' : 'ul'); lastLi.appendChild(sub);
+        if (it.ordered) olAttrsFromMarker(sub, it.marker);
         stack.push({ level: it.level, list: sub }); top = stack[stack.length - 1];
       }
       const li = doc.createElement('li');
@@ -1165,6 +1254,7 @@ function convertTextBullets(root) {
     }
     if (run.length >= 2 || kind === 'bullet-strong') {
       const list = doc.createElement(kind === 'num' ? 'ol' : 'ul');
+      if (kind === 'num') { const n = NUM_RE.exec(run[0].textContent)[1]; if (+n !== 1) list.setAttribute('start', String(+n)); }
       run[0].before(list);
       for (const q of run) { stripLeading(q, kind === 'num' ? NUM_RE : BULLET_RE); const li = doc.createElement('li'); while (q.firstChild) li.appendChild(q.firstChild); q.remove(); list.appendChild(li); }
     }
@@ -1194,44 +1284,68 @@ function looksLikeHtmlCode(t) {
   t = String(t || '').trim();
   return /^<(!doctype|[a-z][a-z0-9]*)\b[^>]*>/i.test(t) && /<\/[a-z][a-z0-9]*>\s*$|<(br|hr|img)\b[^>]*>\s*$/i.test(t);
 }
-/* Import own HTML code. A single wrapper div (max-width / font-family) becomes the wrapper setting. */
-function importHtmlCode(html) {
+/* Import own HTML code. If it is wrapped in the wrapper div (as the exported code is), that div is removed.
+   replaceAll ("Redigera HTML"): a changed wrapper style becomes the new wrapper setting. */
+function importHtmlCode(html, replaceAll = false) {
   const frag = sanitizeHtml(html, 'keep');
   const els = Array.from(frag.childNodes).filter(n => !(isText(n) && WS_ONLY.test(n.data)));
-  if (els.length === 1 && isEl(els[0]) && els[0].tagName === 'DIV') {
-    const st = els[0].getAttribute('style') || '';
-    if (/max-width|font-family/i.test(st)) {
-      if (normCss(st) !== normCss(settings.wrapper) || !settings.wrapperOn) {
-        settings.wrapper = normCss(st); settings.wrapperOn = true; saveSettings(); applyLook();
-        toast('Wrapper-stilen hämtades från den inklistrade koden.');
-      }
+  if (els.length === 1 && isEl(els[0]) && els[0].tagName === 'DIV' && hasBlockChild(els[0])) {
+    const st = normCss(els[0].getAttribute('style') || '');
+    const same = settings.wrapperOn && st === normCss(settings.wrapper);
+    const looksLikeWrapper = same || /(^|;)max-width:/.test(st);
+    if (looksLikeWrapper && (!replaceAll || settings.wrapperOn)) {
+      if (!same && replaceAll) { settings.wrapper = st; saveSettings(); applyLook(); toast('Wrapper-stilen i inställningarna uppdaterades från koden.'); }
+      else if (!same) toast('Den yttre wrapper-diven togs bort – wrappern styrs av inställningarna.');
       const inner = document.createDocumentFragment(); moveChildren(els[0], inner);
+      relinkPresets(inner);
       return inner;
     }
   }
+  relinkPresets(frag);
   return frag;
 }
+/* Re-attach library styles to imported elements whose style matches a preset exactly (so editing the
+   style later updates them). Plain paragraphs with the default style are left alone. */
+function relinkPresets(root) {
+  const defP = normCss(settings.defaults.p);
+  for (const el of $$('p,div,h1,h2,h3,h4,h5,h6,span', root)) {
+    if (el.dataset.preset) continue;
+    const type = el.tagName === 'SPAN' ? 'text' : (el.tagName === 'DIV' && hasBlockChild(el)) ? 'box' : 'block';
+    if (type === 'block' && el.tagName === 'P' && normCss(el.getAttribute('style') || '') === defP) continue;
+    const p = presetMatch(el, type); if (p) el.dataset.preset = p.id;
+  }
+}
 
-/* ---------- undo history ---------- */
+/* ---------- undo history ----------
+   Selections are stored as text positions (robust against the text-node merging that re-parsing causes).
+   Each step remembers where the caret was before the change, so undo puts the caret back there. */
 const hist = {
-  stack: [], i: -1, timer: 0,
-  init() { this.stack = [{ html: editor.innerHTML, sel: null }]; this.i = 0; this.ui(); },
+  stack: [], i: -1, timer: 0, before: null,
+  cur() { const r = getRange(); return r ? textIndexOf(r) : null; },
+  init() { this.stack = [{ html: editor.innerHTML, sel: this.cur(), before: null }]; this.i = 0; this.before = null; this.ui(); },
+  mark() { if (!this.before) this.before = this.cur() || (this.stack[this.i] && this.stack[this.i].sel) || null; },
   commit() {
     clearTimeout(this.timer); this.timer = 0;
-    const html = editor.innerHTML, sel = selPath(), cur = this.stack[this.i];
+    const html = editor.innerHTML, sel = this.cur(), cur = this.stack[this.i];
+    const before = this.before; this.before = null;
     if (cur && cur.html === html) { if (sel) cur.sel = sel; this.ui(); return false; }
     this.stack.length = this.i + 1;
-    this.stack.push({ html, sel });
+    this.stack.push({ html, sel, before });
     if (this.stack.length > 300) this.stack.shift();
     this.i = this.stack.length - 1;
     saveDoc(); this.ui();
     return true;
   },
-  schedule() { clearTimeout(this.timer); this.timer = setTimeout(() => this.commit(), 450); this.ui(); },
+  schedule() { this.mark(); clearTimeout(this.timer); this.timer = setTimeout(() => this.commit(), 450); this.ui(); },
   flush() { if (this.timer) this.commit(); },
-  undo() { this.flush(); if (this.i <= 0) return; this.i--; this.apply(); },
-  redo() { this.flush(); if (this.i >= this.stack.length - 1) return; this.i++; this.apply(); },
-  apply() { const s = this.stack[this.i]; editor.innerHTML = s.html; restoreSelPath(s.sel); saveDoc(); this.ui(); refresh(); },
+  undo() { this.flush(); if (this.i <= 0) return; const undone = this.stack[this.i]; this.i--; this.apply(undone.before || this.stack[this.i].sel); },
+  redo() { this.flush(); if (this.i >= this.stack.length - 1) return; this.i++; this.apply(this.stack[this.i].sel); },
+  apply(sel) {
+    editor.innerHTML = this.stack[this.i].html;
+    editor.focus({ preventScroll: true });
+    if (sel) setTextIndex(sel); else { const b = lastTextBlockIn(editor); if (b) caretToEnd(b); }
+    saveDoc(); this.ui(); refresh();
+  },
   ui() { $('#btn-undo').disabled = this.i <= 0 && !this.timer; $('#btn-redo').disabled = this.i >= this.stack.length - 1; }
 };
 function saveDoc() { store.set(K.doc, editor.innerHTML); }
@@ -1239,6 +1353,7 @@ function saveDoc() { store.set(K.doc, editor.innerHTML); }
 function mutate(fn) {
   hist.flush();
   takeFocus();
+  hist.mark();
   let res;
   try { res = fn(); } catch (err) { console.error(err); toast('Något gick fel: ' + err.message); }
   normalizeEditor();
@@ -1257,7 +1372,7 @@ function splitBlock(B, r) {
   B2.appendChild(frag);
   B.after(B2);
   for (const el of [B, B2]) {
-    for (const x of $$('span,b,i,u,s,strike,strong,em,a,sub,sup,font', el)) if (!hasContent(x) && !x.querySelector('br,img')) x.remove();
+    for (const x of $$('span,b,i,u,s,strike,strong,em,a,sub,sup,font', el)) if (isEmptyInline(x)) x.remove();
     ensureNotEmpty(el);
   }
   return B2;
@@ -1282,6 +1397,10 @@ function handleEnter(shift) {
   if (!B) {
     const { parent, before } = containerInsertPoint(r);
     const p = makeP(); parent.insertBefore(p, before); caretToStart(p); return;
+  }
+  if (!shift && isCell(B) && isAtBlockStart(B, r.startContainer, r.startOffset)) {
+    const table = B.closest('table');
+    if (table.rows[0] && table.rows[0].cells[0] === B && !prevElSib(table)) { const p = makeP(); table.before(p); caretToStart(p); return; }
   }
   if (shift || B.tagName === 'TD' || B.tagName === 'TH') { insertLineBreak(r, B); return; }
   if (B.tagName === 'LI') {
@@ -1332,47 +1451,89 @@ function removeEmptyAncestors(el) {
     const p = el.parentNode; el.remove(); el = p;
   }
 }
-/* Append source's inline content to target. Returns the caret position at the join. */
+/* Append source's own line to the end of target's own line (before any sub list). Returns the caret at the join. */
 function mergeBlocks(target, source) {
   stripTrailingBr(target);
-  if (!hasContent(target)) target.textContent = '';
-  const pos = lastCaretPos(target);
-  const joinAt = pos.node === target ? target.childNodes.length : null;
-  const tLast = lastTextDeep(target), sFirst = firstTextDeep(source);
+  if (!inlineHasContent(target)) clearInlinePart(target);
+  const pos = inlineLastPos(target);
+  const tLast = isText(pos.node) ? pos.node : null;
+  const ref = target.childNodes[inlineEndIndex(target)] || null;
   const nested = [];
+  let sFirst = null;
   while (source.firstChild) {
     const c = source.firstChild;
     if (isBlockEl(c)) { nested.push(c); c.remove(); continue; }
-    target.appendChild(c);
+    if (!sFirst) sFirst = isText(c) ? c : firstTextDeep(c);
+    target.insertBefore(c, ref);
   }
   // "a " + " b" would collapse to one space and the browser drops one when typing: keep both visible
-  if (tLast && sFirst && / $/.test(tLast.data) && /^ /.test(sFirst.data)) tLast.data = tLast.data.slice(0, -1) + ' ';
-  const hostList = target.tagName === 'LI' ? target : null;
-  nested.forEach(n => { if (hostList) hostList.appendChild(n); else target.after(n); });
+  if (tLast && sFirst && / $/.test(tLast.data) && /^ /.test(sFirst.data)) tLast.data = tLast.data.slice(0, -1) + '\u00a0';
+  let after = target;
+  nested.forEach(n => {
+    if (target.tagName === 'LI') { target.appendChild(n); return; }
+    if ((n.tagName === 'UL' || n.tagName === 'OL') && normCss(n.getAttribute('style') || '') === normCss(settings.defaults.sublist)) n.setAttribute('style', listStyleFor(n.tagName, null));
+    after.after(n); after = n;
+  });
   const sp = source.parentNode; source.remove(); removeEmptyAncestors(sp);
+  stripTrailingBr(target);
   ensureNotEmpty(target);
-  if (joinAt !== null) return { node: target, offset: Math.min(joinAt, target.childNodes.length) };
-  return pos;
+  return validPoint(pos.node, pos.offset) ? pos : inlineLastPos(target);
 }
-function deleteSelection() {
+const isCell = el => isEl(el) && (el.tagName === 'TD' || el.tagName === 'TH');
+/* Delete the selection. whole: Backspace/Delete/cut, where a fully selected paragraph (triple-click) is removed.
+   Otherwise (typing, paste, Enter) the selected paragraph keeps its style and the next paragraph is untouched. */
+function deleteSelection(opts = {}) {
   const r = getRange(); if (!r || r.collapsed) return;
-  const sb = closestTextBlock(r.startContainer), eb = closestTextBlock(r.endContainer);
+  let sb = closestTextBlock(r.startContainer), eb = closestTextBlock(r.endContainer);
+  if ((isCell(sb) || isCell(eb)) && sb !== eb) { deleteAcrossCells(r); return; }
   const endAtStart = eb && sb !== eb && isAtBlockStart(eb, r.endContainer, r.endOffset);
+  if (endAtStart && !opts.whole) {
+    const blocks = selectedTextBlocks(r);
+    const last = blocks[blocks.length - 1];
+    if (last && last !== eb) { r.setEnd(last, inlineEndIndex(last)); eb = last; }
+  }
   r.deleteContents();
   let pos = { node: r.startContainer, offset: r.startOffset };
-  const cellish = b => b && (b.tagName === 'TD' || b.tagName === 'TH');
-  if (sb && eb && sb !== eb && sb.isConnected && eb.isConnected && !cellish(sb) && !cellish(eb)) {
-    if (endAtStart && !hasContent(sb) && !sb.querySelector('img')) {
+  if (sb && eb && sb !== eb && sb.isConnected && eb.isConnected) {
+    if (endAtStart && opts.whole && !inlineHasContent(sb) && !sb.querySelector('img')) {
       const sp = sb.parentNode; sb.remove(); removeEmptyAncestors(sp); caretToStart(eb); return;
     }
     pos = mergeBlocks(sb, eb);
   } else if (sb && sb.isConnected) {
-    for (const x of $$('span,b,i,u,s,strike,strong,em,a,sub,sup,font', sb)) if (!hasContent(x) && !x.querySelector('br,img')) x.remove();
+    for (const x of $$('span,b,i,u,s,strike,strong,em,a,sub,sup,font', sb)) if (isEmptyInline(x)) x.remove();
     ensureNotEmpty(sb);
   }
   if (!editor.firstElementChild) { const p = makeP(); editor.appendChild(p); caretToStart(p); return; }
-  if (validPoint(pos.node, pos.offset)) setCaret(pos.node, pos.offset);
+  if (sb && sb.isConnected && !inlineHasContent(sb)) caretToStart(sb);   // before the placeholder <br>, not after it
+  else if (validPoint(pos.node, pos.offset)) setCaret(pos.node, pos.offset);
   else if (sb && sb.isConnected) caretToEnd(sb);
+}
+/* A selection that starts or ends in a table cell: clear the selected text in each cell but keep the table,
+   and delete what is selected outside the table without merging it into a cell. */
+function deleteAcrossCells(r) {
+  const sCell = closestEl(r.startContainer, isCell), eCell = closestEl(r.endContainer, isCell);
+  const sTable = sCell && sCell.closest('table'), eTable = eCell && eCell.closest('table');
+  const parts = [];
+  if (sTable && eTable && sTable !== eTable) { const a = document.createRange(); a.setStartAfter(sTable); a.setEndBefore(eTable); parts.push(a); }
+  else if (sTable && !eTable) { const a = document.createRange(); a.setStartAfter(sTable); a.setEnd(r.endContainer, r.endOffset); parts.push(a); }
+  else if (!sTable && eTable) { const a = document.createRange(); a.setStart(r.startContainer, r.startOffset); a.setEndBefore(eTable); parts.push(a); }
+  const cells = [];
+  for (const t of new Set([sTable, eTable].filter(Boolean))) {
+    for (const c of $$('td,th', t)) {
+      if (c.closest('table') !== t || !r.intersectsNode(c)) continue;
+      const cr = document.createRange(); cr.selectNodeContents(c);
+      const sub = intersectRange(r, cr); if (sub) { parts.push(sub); cells.push(c); }
+    }
+  }
+  const outsideStart = !sTable ? parts[0] : null;
+  parts.forEach(p => p.deleteContents());
+  cells.forEach(c => { for (const x of $$('span,b,i,u,s,strike,strong,em,a,sub,sup,font', c)) if (isEmptyInline(x)) x.remove(); ensureNotEmpty(c); });
+  if (sCell && sCell.isConnected) caretToEnd(sCell);
+  else if (outsideStart && validPoint(outsideStart.startContainer, outsideStart.startOffset)) {
+    const b = closestTextBlock(outsideStart.startContainer);
+    if (b) ensureNotEmpty(b);
+    setCaret(outsideStart.startContainer, outsideStart.startOffset);
+  }
 }
 function backspaceAtStart(B) {
   if (B.tagName === 'TD' || B.tagName === 'TH') return;
@@ -1550,38 +1711,52 @@ function selectCellContent(cell) {
   if (hasContent(cell)) { const a = firstCaretPos(cell), b = lastCaretPos(cell); setSel(a.node, a.offset, b.node, b.offset); }
   else caretToStart(cell);
 }
+/* Column positions count merged cells (colspan), so rows with merged or missing cells stay consistent. */
+function colStart(cell) { let c = 0; for (const x of cell.parentNode.cells) { if (x === cell) return c; c += x.colSpan || 1; } return c; }
+function cellAtCol(row, col) { let c = 0; for (const x of row.cells) { const n = x.colSpan || 1; if (col < c + n) return x; c += n; } return null; }
+function rowWidth(row) { let c = 0; for (const x of row.cells) c += x.colSpan || 1; return c; }
 function tableOp(op) {
   const cell = currentCell(); if (!cell) return;
   const tr = cell.parentNode, table = cell.closest('table');
-  const ci = Array.from(tr.cells).indexOf(cell);
   const rows = Array.from(table.rows);
-  const pick = (row, i) => row.cells[Math.min(i, row.cells.length - 1)];
+  const col = colStart(cell), span = cell.colSpan || 1;
+  const width = Math.max(...rows.map(rowWidth));
+  const caretAt = (row, c) => { const x = row && row.isConnected ? cellAtCol(row, Math.min(c, rowWidth(row) - 1)) : null; if (x) caretToStart(x); };
   switch (op) {
     case 'row-above': case 'row-below': {
       const nr = document.createElement('tr');
-      for (let i = 0; i < tr.cells.length; i++) nr.appendChild(makeCell('td'));
+      for (let i = 0; i < width; i++) nr.appendChild(makeCell('td'));
       if (op === 'row-below') tr.after(nr); else tr.before(nr);
-      caretToStart(pick(nr, ci)); break;
+      caretAt(nr, col); break;
     }
     case 'col-left': case 'col-right': {
+      const at = op === 'col-right' ? col + span - 1 : col;
       rows.forEach(row => {
-        const ref = row.cells[Math.min(ci, row.cells.length - 1)];
-        const nc = makeCell(ref && ref.tagName === 'TH' ? 'th' : 'td');
-        if (!ref) row.appendChild(nc); else if (op === 'col-right') ref.after(nc); else ref.before(nc);
+        const x = cellAtCol(row, at);
+        if (!x) { row.appendChild(makeCell('td')); return; }
+        const xs = colStart(x), xe = xs + (x.colSpan || 1) - 1;
+        const inside = op === 'col-right' ? at < xe : at > xs;           // the new column falls inside a merged cell
+        if (inside) { x.colSpan = (x.colSpan || 1) + 1; return; }
+        const nc = makeCell(x.tagName === 'TH' ? 'th' : 'td');
+        if (op === 'col-right') x.after(nc); else x.before(nc);
       });
-      caretToStart(op === 'col-right' ? tr.cells[ci + 1] : tr.cells[ci]); break;
+      caretAt(tr, op === 'col-right' ? col + span : col); break;
     }
     case 'row-del': {
-      const other = tr.nextElementSibling || tr.previousElementSibling || (rows[rows.indexOf(tr) + 1] || rows[rows.indexOf(tr) - 1]);
+      const i = rows.indexOf(tr);
+      const other = rows[i + 1] || rows[i - 1] || null;
       tr.remove();
       if (!table.rows.length) { removeTable(table); break; }
-      caretToStart(pick(other, ci)); break;
+      caretAt(other, col); break;
     }
     case 'col-del': {
-      rows.forEach(row => { const c = row.cells[ci]; if (c) c.remove(); });
+      rows.forEach(row => {
+        const x = cellAtCol(row, col); if (!x) return;
+        if ((x.colSpan || 1) > 1) x.colSpan -= 1; else x.remove();
+      });
       rows.forEach(row => { if (!row.cells.length) row.remove(); });
       if (!table.rows.length) { removeTable(table); break; }
-      caretToStart(pick(tr, ci)); break;
+      caretAt(tr.isConnected ? tr : table.rows[0], col); break;
     }
     case 'header': {
       const first = table.rows[0];
@@ -1645,9 +1820,14 @@ function applyInline(props, presetId) {
     const frag = sub.extractContents();
     if (!/\S/.test(frag.textContent) && !frag.querySelector('img')) { sub.insertNode(frag); continue; }
     for (const el of $$(INLINE_TAGS_SEL, frag)) {
-      if (!el.hasAttribute('style')) continue;
       const m = getStyle(el); let ch = false;
-      keys.forEach(k => { if (m.delete(k)) ch = true; if (k === 'background-color' && m.delete('background')) ch = true; });
+      if (el.tagName === 'A') {                        // links have their own color: set it rather than remove it
+        const def = parseCss(settings.defaults.a);
+        keys.forEach(k => { const v = setMap.has(k) ? setMap.get(k) : def.get(k); if (v) m.set(k, v); else m.delete(k); ch = true; });
+      } else {
+        if (!el.hasAttribute('style')) continue;
+        keys.forEach(k => { if (m.delete(k)) ch = true; if (k === 'background-color' && m.delete('background')) ch = true; });
+      }
       if (ch) setStyle(el, m);
     }
     if (presetId) $$('[data-preset]', frag).forEach(el => { if (el.tagName === 'SPAN') delete el.dataset.preset; });
@@ -1694,7 +1874,7 @@ function clearInline(r, blocks) {
   return { first, last };
 }
 function resetBlock(B, sel) {
-  delete B.dataset.preset;
+  delete B.dataset.preset; delete B.dataset.mb;
   if (B.tagName === 'LI') { B.setAttribute('style', normCss(settings.defaults.li)); return B; }
   if (B.tagName === 'TD' || B.tagName === 'TH') { B.setAttribute('style', normCss(settings.defaults[B.tagName.toLowerCase()])); return B; }
   let el = B;
@@ -1713,14 +1893,56 @@ function clearFormatting() {
   if (collapsed) restoreSel(sel);
   else if (first && last && first.isConnected && last.isConnected) setSel(first, 0, last, last.length);
 }
-function execInline(cmd) {
-  mutate(() => {
-    const r = getRange(); if (!r) return;
-    if (r.collapsed) { document.execCommand(cmd, false, null); return; }
-    document.execCommand('styleWithCSS', false, false);
-    document.execCommand(cmd, false, null);
-  });
+const FMT = {
+  bold: { tags: /^(B|STRONG)$/, make: 'b', prop: 'font-weight', off: '400', on: el => (parseInt(getComputedStyle(el).fontWeight, 10) || 400) >= 600 },
+  italic: { tags: /^(I|EM)$/, make: 'i', prop: 'font-style', off: 'normal', on: el => /italic|oblique/.test(getComputedStyle(el).fontStyle) },
+  underline: { tags: /^(U|INS)$/, make: 'u', prop: 'text-decoration', deco: 'underline', on: el => hasDeco(el, /^(U|INS)$/, 'underline') },
+  strikeThrough: { tags: /^(S|STRIKE|DEL)$/, make: 's', prop: 'text-decoration', deco: 'line-through', on: el => hasDeco(el, /^(S|STRIKE|DEL)$/, 'line-through') }
+};
+function hasDeco(el, tags, word) {
+  for (let n = el; n && n !== editor; n = n.parentNode) {
+    if (!isEl(n)) continue;
+    if (tags.test(n.tagName) || (getStyle(n).get('text-decoration') || '').includes(word)) return true;
+  }
+  return false;
 }
+const fmtHasProp = (f, el) => { const v = getStyle(el).get(f.prop); return !!v && (!f.deco || v.includes(f.deco)); };
+/* Toggle bold/italic/underline/strike on the selected text only. On if any selected text lacks it, else off. */
+function toggleFormat(cmd) {
+  const r = getRange(); if (!r) return;
+  if (r.collapsed) { document.execCommand(cmd, false, null); return; }     // typing style for the next characters
+  const f = FMT[cmd];
+  let texts = textNodesIn(commonEl(r)).filter(t => r.intersectsNode(t) && t.length && closestTextBlock(t));
+  if (texts.some(t => /\S/.test(t.data))) texts = texts.filter(t => /\S/.test(t.data));   // a lone space may be formatted too
+  const turnOff = texts.length > 0 && texts.every(t => f.on(t.parentNode));
+  const rr = r.cloneRange();
+  let first = null, last = null;
+  for (const B of selectedTextBlocks(rr)) {
+    const sub = intersectRange(rr, inlineRangeOf(B)); if (!sub) continue;
+    const frag = sub.extractContents();
+    if (!frag.textContent) { sub.insertNode(frag); continue; }
+    $$('*', frag).forEach(el => { if (f.tags.test(el.tagName)) unwrap(el); });
+    $$('[style]', frag).forEach(el => { if (fmtHasProp(f, el)) { const m = getStyle(el); m.delete(f.prop); setStyle(el, m); } });
+    const node = document.createElement(turnOff ? 'span' : f.make);
+    if (turnOff) node.dataset.tmp = '1';
+    node.appendChild(frag); sub.insertNode(node);
+    // lift the text out of elements that set this format (on: e.g. a font-weight:400 span, off: a <b> around it)
+    const ancs = [];
+    for (let a = node.parentNode; a && a !== B; a = a.parentNode) if (isEl(a) && (fmtHasProp(f, a) || (turnOff && f.tags.test(a.tagName)))) ancs.push(a);
+    for (const anc of ancs.reverse()) {
+      splitAround(node, anc);
+      if (f.tags.test(anc.tagName)) unwrap(anc);
+      else { const m = getStyle(anc); m.delete(f.prop); setStyle(anc, m); if (anc.tagName === 'SPAN' && !styleString(m) && !anc.dataset.preset) unwrap(anc); }
+    }
+    if (!turnOff && f.on(node.parentNode)) node.dataset.tmp = '1';                   // already on from the paragraph (bold heading)
+    if (turnOff && f.off && f.on(node)) { node.setAttribute('style', f.prop + ':' + f.off + ';'); delete node.dataset.tmp; }   // e.g. bold heading
+    const tn = textNodesIn(node); if (tn.length) { if (!first) first = tn[0]; last = tn[tn.length - 1]; }
+    if (node.dataset.tmp) unwrap(node);
+  }
+  if (first && last && first.isConnected && last.isConnected) setSel(first, 0, last, last.length);
+}
+function commonEl(r) { const c = r.commonAncestorContainer; return isText(c) ? c.parentNode : c; }
+function execInline(cmd) { mutate(() => toggleFormat(cmd)); }
 function captureInlineStyle(node) {
   const m = new Map();
   const chain = [];
@@ -1746,7 +1968,13 @@ function applyBlockPreset(p) {
     const sel = saveSel();
     for (const B of blocksForFormat()) {
       let el = B;
-      if (p.tag && !/^(LI|TD|TH)$/.test(B.tagName) && B.tagName.toLowerCase() !== p.tag) { el = retag(B, p.tag); sel.map.set(B, el); }
+      delete B.dataset.mb;
+      if (/^(LI|TD|TH)$/.test(B.tagName)) {             // keep the item's/cell's own layout (border, padding …)
+        const m = getStyle(B);
+        for (const [k, v] of parseCss(p.css)) if (!(B.tagName !== 'LI' && /^margin/.test(k))) m.set(k, v);
+        setStyle(B, m); continue;
+      }
+      if (p.tag && B.tagName.toLowerCase() !== p.tag) { el = retag(B, p.tag); sel.map.set(B, el); }
       el.setAttribute('style', normCss(p.css)); el.dataset.preset = p.id;
     }
     restoreSel(sel);
@@ -1902,6 +2130,8 @@ function handlePaste(dt) {
 function selectionHtml(r) {
   const holder = document.createElement('div');
   holder.appendChild(r.cloneContents());
+  const list = closestEl(r.commonAncestorContainer, el => el.tagName === 'UL' || el.tagName === 'OL');
+  if (list && Array.from(holder.children).some(c => c.tagName === 'LI')) { const l = list.cloneNode(false); moveChildren(holder, l); holder.appendChild(l); }
   return serializeDoc({ root: holder, wrapper: false, keepData: true, trimLast: false });
 }
 
@@ -2505,7 +2735,10 @@ for (const [id, side] of [['#sel-mt', 0], ['#sel-mb', 2]]) {
   $(id).addEventListener('change', e => {
     let v = e.target.value; if (v === '__cur') return;
     if (v === '__other') { v = askValue('Avstånd (t.ex. 18px):', '18px'); if (v == null) { refresh(); return; } v = withPx(v); }
-    setBlockProp(m => setMarginSide(m, side, v || '0'));
+    setBlockProp((m, B) => {
+      setMarginSide(m, side, v || '0');
+      if (side === 2) { if (v) B.dataset.mb = '1'; else delete B.dataset.mb; }   // explicit: not zeroed as last element
+    });
   });
 }
 $('#sel-lh').addEventListener('change', e => { const v = e.target.value; if (v === '__cur') return; setBlockProp(m => { if (v) m.set('line-height', v); else m.delete('line-height'); }); });
@@ -2526,18 +2759,28 @@ editor.addEventListener('keydown', e => {
   if (e.key === 'Tab') { e.preventDefault(); handleTab(e.shiftKey); return; }
   if (e.key === 'Backspace' || e.key === 'Delete') {
     const r = getRange(); if (!r) return;
-    if (!r.collapsed) { if (spansBlocks(r)) { e.preventDefault(); mutate(deleteSelection); } return; }
+    if (!r.collapsed) { if (spansBlocks(r)) { e.preventDefault(); mutate(() => deleteSelection({ whole: true })); } return; }
     const B = closestTextBlock(r.startContainer); if (!B) return;
     if (e.key === 'Backspace' && isAtBlockStart(B, r.startContainer, r.startOffset)) { e.preventDefault(); mutate(() => backspaceAtStart(B)); }
     else if (e.key === 'Delete' && isAtBlockEnd(B, r.startContainer, r.startOffset)) { e.preventDefault(); mutate(() => deleteAtEnd(B)); }
     return;
   }
-  if (e.key.length === 1 && !e.altKey) {
+  if (e.key.length === 1) {                            // incl. AltGr/Option characters such as @ £ € { }
     const r = getRange();
-    if (r && !r.collapsed && spansBlocks(r)) { hist.flush(); deleteSelection(); }
+    if (r && !r.collapsed && spansBlocks(r)) { hist.flush(); hist.mark(); deleteSelection(); }
   }
 });
 editor.addEventListener('beforeinput', e => {
+  if (!/^history/.test(e.inputType)) hist.mark();
+  if ((e.inputType === 'insertText' || e.inputType === 'insertReplacementText') && e.data) {
+    const r = getRange();
+    if (r && !r.collapsed && spansBlocks(r)) {         // e.g. dead keys: replace a multi-paragraph selection ourselves
+      e.preventDefault();
+      const text = e.data;
+      mutate(() => { deleteSelection(); const rr = getRange(); if (rr) insertInline([document.createTextNode(text)], rr); });
+      return;
+    }
+  }
   switch (e.inputType) {
     case 'historyUndo': e.preventDefault(); hist.undo(); break;
     case 'historyRedo': e.preventDefault(); hist.redo(); break;
@@ -2546,6 +2789,7 @@ editor.addEventListener('beforeinput', e => {
   }
 });
 editor.addEventListener('input', e => { if (e.isComposing) return; normalizeEditor(); hist.schedule(); refresh(); });
+editor.addEventListener('compositionstart', () => { const r = getRange(); if (r && !r.collapsed && spansBlocks(r)) { hist.flush(); hist.mark(); deleteSelection(); } });
 editor.addEventListener('compositionend', () => { normalizeEditor(); hist.schedule(); refresh(); });
 editor.addEventListener('paste', e => { e.preventDefault(); const dt = e.clipboardData; mutate(() => handlePaste(dt)); });
 editor.addEventListener('copy', e => {
@@ -2559,7 +2803,7 @@ editor.addEventListener('cut', e => {
   e.preventDefault();
   e.clipboardData.setData('text/html', '<meta name="mhe-fragment" content="1">' + selectionHtml(r));
   e.clipboardData.setData('text/plain', window.getSelection().toString());
-  mutate(deleteSelection);
+  mutate(() => deleteSelection({ whole: true }));
 });
 editor.addEventListener('dragstart', e => e.preventDefault());
 editor.addEventListener('drop', e => {
@@ -2575,7 +2819,10 @@ editor.addEventListener('click', e => { const a = e.target.closest && e.target.c
 function applyInspector() {
   const t = inspTarget; if (!t || !t.isConnected) return;
   const css = normCss($('#insp-style').value);
-  mutate(() => { if (css) t.setAttribute('style', css); else t.setAttribute('style', ''); });
+  mutate(() => {
+    if (getMarginSide(getStyle(t), 2) !== getMarginSide(parseCss(css), 2)) t.dataset.mb = '1';
+    t.setAttribute('style', css);
+  });
   toast('Stilen uppdaterades.');
 }
 $('#insp-style').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); applyInspector(); } if (e.key === 'Escape') { e.preventDefault(); takeFocus(); } });
@@ -2607,7 +2854,7 @@ $('#code-copy').addEventListener('click', () => copyText(serializeDoc()));
 function setCodeEdit(on) {
   $('#code-out').hidden = on; $('#code-editwrap').hidden = !on;
   $('#code-edit').hidden = on; $('#code-copy').hidden = on;
-  if (on) { $('#code-textarea').value = serializeDoc({ pretty: true }); $('#code-textarea').focus(); }
+  if (on) { $('#code-textarea').value = serializeDoc({ pretty: true, trimLast: false, keepMb: true }); $('#code-textarea').focus(); }
 }
 $('#code-edit').addEventListener('click', () => setCodeEdit(true));
 $('#code-cancel').addEventListener('click', () => { setCodeEdit(false); takeFocus(); });
@@ -2615,7 +2862,7 @@ $('#code-apply').addEventListener('click', () => {
   const v = $('#code-textarea').value;
   setCodeEdit(false);
   mutate(() => {
-    const frag = v.trim() ? importHtmlCode(v) : document.createDocumentFragment();
+    const frag = v.trim() ? importHtmlCode(v, true) : document.createDocumentFragment();
     editor.innerHTML = ''; editor.appendChild(frag);
     normalizeEditor();
     const b = lastTextBlockIn(editor); if (b) caretToEnd(b);

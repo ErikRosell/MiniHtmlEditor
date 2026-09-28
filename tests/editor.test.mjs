@@ -493,6 +493,228 @@ await test('a block style from the sidebar applies to the paragraph at the curso
   eq(await out(), `<div style="margin:0 0 10px 0;font-size:20px;font-weight:700;color:var(--muBlue);">Ett</div><p style="${P0}">Slut</p>`);
 });
 
+console.log('\nRegressions from code review');
+const tripleClick = (idx) => page.evaluate(i => {  // select block i from its start to the start of the next block
+  const ed = document.getElementById('editor');
+  const blocks = Array.from(ed.querySelectorAll('p,div,li')).filter(b => !b.querySelector('p,div,ul,ol,table'));
+  const r = document.createRange(); r.setStart(blocks[i], 0); r.setEnd(blocks[i + 1], 0);
+  ed.focus(); getSelection().removeAllRanges(); getSelection().addRange(r);
+}, idx);
+await test('typing over a triple-clicked heading replaces its text and keeps the next paragraph', async () => {
+  await setDoc(`<p style="${P}">Före</p><div style="${H}">Gammal rubrik</div><p style="${P}">Brödtext här.</p>`);
+  await tripleClick(1);
+  await type('Ny');
+  eq(await out(), `<p style="${P}">Före</p><div style="${H}">Ny</div><p style="${P0}">Brödtext här.</p>`);
+});
+await test('typing over a triple-clicked list item keeps the following item', async () => {
+  await setDoc(`<ul style="${UL}"><li style="${LI}">Ett</li><li style="${LI}">Två</li></ul><p style="${P}">Slut</p>`);
+  await tripleClick(0);
+  await type('Ny');
+  eq(await out(), `<ul style="${UL}"><li style="${LI}">Ny</li><li style="${P0}">Två</li></ul><p style="${P0}">Slut</p>`);
+});
+await test('pasting over the triple-clicked last line of a box stays in the box', async () => {
+  await setDoc(`<div style="padding:10px;" data-preset="box-info"><p style="${P}">Ett</p><p style="${P}">Sista</p></div><p style="${P}">Utanför</p>`);
+  await tripleClick(1);
+  await paste({ text: 'Ny text' });
+  eq(await out(), `<div style="padding:10px;"><p style="${P}">Ett</p><p style="${P0}">Ny text</p></div><p style="${P0}">Utanför</p>`);
+});
+await test('Delete on a triple-clicked paragraph removes the whole paragraph', async () => {
+  await setDoc(`<p style="${P}">Ett</p><p style="${P}">Två</p><p style="${P}">Tre</p>`);
+  await tripleClick(1);
+  await key('Delete');
+  eq(await out(), `<p style="${P}">Ett</p><p style="${P0}">Tre</p>`);
+});
+await test('a blank line inside a bold selection still exports as &nbsp;', async () => {
+  await setDoc(`<p style="${P}">Ett</p><p style="${P}"><br></p><p style="${P}">Två</p>`);
+  await select('Ett', 'Två');
+  await key('Control+b');
+  eq(await out(), `<p style="${P}"><b>Ett</b></p><p style="${P}">&nbsp;</p><p style="${P0}"><b>Två</b></p>`);
+});
+await test('pasting one styled div as code keeps it and does not change the wrapper', async () => {
+  await setDoc(`<p style="${P}"><br></p>`);
+  await caretIn('p');
+  await paste({ text: '<div style="font-family:Georgia,serif;font-size:22px;color:#c92a2a;margin:0 0 10px 0;">Min rubrik</div>' });
+  eq(await out({}), '<div style="max-width:760px;font-family:Arial,sans-serif;font-size:14px;line-height:1.5;color:#222;"><div style="font-family:Georgia,serif;font-size:22px;color:#c92a2a;margin:0;">Min rubrik</div></div>');
+});
+await test('pasting a box as code keeps the box', async () => {
+  await setDoc(`<p style="${P}"><br></p>`);
+  await caretIn('p');
+  await paste({ text: '<div style="padding:12px;background:#fff8e6;font-family:Verdana;"><p style="margin:0;">I rutan</p></div>' });
+  eq(await out(), '<div style="padding:12px;background:#fff8e6;font-family:Verdana;"><p style="margin:0;">I rutan</p></div>');
+  eq(await page.evaluate(() => MHE.settings.wrapper), 'max-width:760px;font-family:Arial,sans-serif;font-size:14px;line-height:1.5;color:#222;', 'wrapper');
+});
+await test('Word smart tags and content controls keep their text', async () => {
+  await setDoc(`<p style="${P}"><br></p>`);
+  await caretIn('p');
+  await paste({ html: '<p class=MsoNormal>Mötet hålls i <st1:City><st1:place>Stockholm</st1:place></st1:City> den <st1:date>5 mars</st1:date>.<o:p></o:p></p><w:Sdt><p class=MsoNormal>Rapport</p></w:Sdt>', text: 'x' });
+  eq(await out(), `<p style="${P}">Mötet hålls i Stockholm den 5 mars.</p><p style="${P0}">Rapport</p>`);
+});
+const SUBLIST = `<ul style="${UL}"><li style="${LI}">Ett<ul style="margin:6px 0 0 0;padding-left:20px;"><li style="${LI}">Sub1</li><li style="${LI}">Sub2</li></ul></li><li style="${LI}">Två</li></ul><p style="${P}">Slut</p>`;
+await test('Enter at the end of an item with a sub list gives a new item with the cursor in it', async () => {
+  await setDoc(SUBLIST);
+  await caret('Ett', 3);
+  await key('Enter'); await type('X');
+  eq(await out(), `<ul style="${UL}"><li style="${LI}">Ett</li><li style="${LI}">X<ul style="margin:6px 0 0 0;padding-left:20px;"><li style="${LI}">Sub1</li><li style="${P0}">Sub2</li></ul></li><li style="${P0}">Två</li></ul><p style="${P0}">Slut</p>`);
+});
+await test('Delete at the end of an item pulls up its first sub item on the same line', async () => {
+  await setDoc(SUBLIST);
+  await caret('Ett', 3);
+  await key('Delete'); await type('!');
+  eq(await out(), `<ul style="${UL}"><li style="${LI}">Ett!Sub1<ul style="margin:6px 0 0 0;padding-left:20px;"><li style="${P0}">Sub2</li></ul></li><li style="${P0}">Två</li></ul><p style="${P0}">Slut</p>`);
+});
+await test('typing over a selection from an item into its sub item', async () => {
+  await setDoc(SUBLIST);
+  await select('Ett', 'Sub1', 2, 2);
+  await type('X');
+  eq(await out(), `<ul style="${UL}"><li style="${LI}">EtXb1<ul style="margin:6px 0 0 0;padding-left:20px;"><li style="${P0}">Sub2</li></ul></li><li style="${P0}">Två</li></ul><p style="${P0}">Slut</p>`);
+});
+const TABLE3 = '<table style="border-collapse:collapse;"><tbody><tr><td style="padding:4px;">A1</td><td style="padding:4px;">B1</td></tr><tr><td style="padding:4px;">A2</td><td style="padding:4px;">B2</td></tr><tr><td style="padding:4px;">A3</td><td style="padding:4px;">B3</td></tr></tbody></table>';
+await test('deleting a selection across table rows keeps every cell', async () => {
+  await setDoc(TABLE3 + `<p style="${P}">Slut</p>`);
+  await select('A1', 'A2');
+  await key('Delete');
+  eq(await page.evaluate(() => Array.from(document.querySelectorAll('#editor tr')).map(r => r.cells.length).join(',')), '2,2,2', 'cells per row');
+  eq(await out(), '<table style="border-collapse:collapse;"><tr><td style="padding:4px;"></td><td style="padding:4px;"></td></tr><tr><td style="padding:4px;"></td><td style="padding:4px;">B2</td></tr><tr><td style="padding:4px;">A3</td><td style="padding:4px;">B3</td></tr></table>' + `<p style="${P0}">Slut</p>`);
+});
+await test('typing over a selection from a cell to text after the table keeps the table', async () => {
+  await setDoc(TABLE3 + `<p style="${P}">Slut</p>`);
+  await select('A2', 'Slut', 1, 2);
+  await type('X');
+  eq(await out(), '<table style="border-collapse:collapse;"><tr><td style="padding:4px;">A1</td><td style="padding:4px;">B1</td></tr><tr><td style="padding:4px;">AX</td><td style="padding:4px;"></td></tr><tr><td style="padding:4px;"></td><td style="padding:4px;"></td></tr></table>' + `<p style="${P0}">ut</p>`);
+});
+await test('deleting a column in a table with merged cells', async () => {
+  await setDoc(`<table style="border-collapse:collapse;"><tbody><tr><td colspan="2" style="padding:4px;">Rubrik</td></tr><tr><td style="padding:4px;">A</td><td style="padding:4px;">B</td></tr></tbody></table><p style="${P}">Slut</p>`);
+  const spans = () => page.evaluate(() => Array.from(document.querySelectorAll('#editor tr')).map(r => Array.from(r.cells).map(c => c.colSpan).join('+')).join(','));
+  await caret('A', 1); await settle();
+  await page.click('[data-tab="col-right"]');
+  eq(await spans(), '3,1+1+1', 'a column added inside a merged cell widens it');
+  await caret('Rubrik', 2); await settle();
+  await page.click('[data-tab="col-del"]');
+  ok(!(await page.$eval('#toast', t => t.textContent)).includes('fel'), 'error toast');
+  eq(await spans(), '2,1+1', 'deleting shrinks the merged cell');
+  eq(await out(), `<table style="border-collapse:collapse;"><tr><td colspan="2" style="padding:4px;">Rubrik</td></tr><tr><td style="border:1px solid #d0d7de;padding:6px 8px;"></td><td style="padding:4px;">B</td></tr></table><p style="${P0}">Slut</p>`);
+});
+await test('a block style in a table cell keeps the cell border and padding', async () => {
+  await setDoc(`<table style="border-collapse:collapse;"><tbody><tr><td style="border:1px solid #ccc;padding:4px;">A</td></tr></tbody></table><p style="${P}">Slut</p>`);
+  await caret('A', 1);
+  await page.selectOption('#sel-block', 'h-sub');
+  eq(await out(), `<table style="border-collapse:collapse;"><tr><td style="border:1px solid #ccc;padding:4px;font-size:16px;font-weight:600;color:var(--muBlue);">A</td></tr></table><p style="${P0}">Slut</p>`);
+});
+await test('a text color over a link colors the link too', async () => {
+  await setDoc(`<p style="${P}">Läs <a href="https://example.com" style="color:var(--muBlue);">mer här</a> nu</p><p style="${P}">Slut</p>`);
+  await select('Läs', 'nu');
+  await page.click('[data-pop="color"]');
+  await page.click('.popover .sw[data-v="#c92a2a"]');
+  eq(await out(), `<p style="${P}"><span style="color:#c92a2a;">Läs <a href="https://example.com" style="color:#c92a2a;">mer här</a> nu</span></p><p style="${P0}">Slut</p>`);
+});
+await test('text inserted without a keydown (dead keys) over a multi-paragraph selection', async () => {
+  await setDoc(`<div style="${H}">Rubrik</div><p style="${P}">text här</p><p style="${P}">Slut</p>`);
+  await select('Rubrik', 'text här', 3, 4);
+  await page.keyboard.insertText('é');
+  eq(await out(), `<div style="${H}">Rubé här</div><p style="${P0}">Slut</p>`);
+});
+await test('undo puts the cursor back where the change was, redo after it', async () => {
+  await setDoc(`<p style="${P}">Hej världen</p><p style="${P}">Slut</p>`);
+  await caret('Hej världen', 4);
+  await paste({ html: '<p>fina </p>', text: 'fina ' });
+  await key('Control+z'); await type('Q');
+  eq(await out(), `<p style="${P}">Hej Qvärlden</p><p style="${P0}">Slut</p>`, 'after undo');
+  await page.waitForTimeout(500);
+  await key('Control+z'); await key('Control+y'); await type('W');
+  eq(await out(), `<p style="${P}">Hej QWvärlden</p><p style="${P0}">Slut</p>`, 'after redo');
+});
+await test('copying numbered list items and pasting keeps one numbered list', async () => {
+  await setDoc(`<ol style="${UL}"><li style="${LI}">Ett</li><li style="${LI}">Två</li><li style="${LI}">Tre</li></ol><p style="${P}"><br></p>`);
+  await select('Ett', 'Två');
+  const clip = await page.evaluate(() => { const dt = new DataTransfer(); document.getElementById('editor').dispatchEvent(new ClipboardEvent('copy', { clipboardData: dt, bubbles: true, cancelable: true })); return dt.getData('text/html'); });
+  await caretIn('p');
+  await paste({ html: clip, text: 'Ett\nTvå' });
+  eq(await out(), `<ol style="${UL}"><li style="${LI}">Ett</li><li style="${LI}">Två</li><li style="${P0}">Tre</li></ol><ol style="margin:0;padding-left:20px;"><li style="${LI}">Ett</li><li style="${P0}">Två</li></ol>`);
+});
+await test('"↓ avstånd" on the last item of a list is kept', async () => {
+  await setDoc(`<ul style="${UL}"><li style="${LI}">Ett</li><li style="${LI}">Två</li></ul><p style="${P}">Slut</p>`);
+  await caret('Två', 1);
+  await page.selectOption('#sel-mb', '32px');
+  eq(await out(), `<ul style="${UL}"><li style="${LI}">Ett</li><li style="margin:0 0 32px 0;">Två</li></ul><p style="${P0}">Slut</p>`);
+});
+await test('underlining just a space does not join the words', async () => {
+  await setDoc(`<p style="${P}">Hej du</p><p style="${P}">Slut</p>`);
+  await select('Hej du', 'Hej du', 3, 4);
+  await key('Control+u');
+  eq(await out(), `<p style="${P}">Hej<u> </u>du</p><p style="${P0}">Slut</p>`);
+});
+await test('Word "List Paragraph" continuation text stays in its item', async () => {
+  await setDoc(`<p style="${P}"><br></p>`);
+  await caretIn('p');
+  await paste({ html: `<p class=MsoListParagraphCxSpFirst style='mso-list:l0 level1 lfo1'><![if !supportLists]><span style='mso-list:Ignore'>·</span><![endif]>Ett</p><p class=MsoListParagraphCxSpMiddle>fortsättning</p><p class=MsoListParagraphCxSpLast style='mso-list:l0 level1 lfo1'><![if !supportLists]><span style='mso-list:Ignore'>·</span><![endif]>Två</p>`, text: 'x' });
+  eq(await out(), `<ul style="margin:0;padding-left:20px;"><li style="${LI}">Ett<br>fortsättning</li><li style="${P0}">Två</li></ul>`);
+});
+await test('numbered text that starts at 3 keeps its numbering', async () => {
+  await setDoc(`<p style="${P}"><br></p>`);
+  await caretIn('p');
+  await paste({ text: '3. Tre\n4. Fyra' });
+  eq(await out(), `<ol start="3" style="margin:0;padding-left:20px;"><li style="${LI}">Tre</li><li style="${P0}">Fyra</li></ol>`);
+});
+await test('HTML code: <br> between blocks, <pre> lines, newline in href, nbsp after digits', async () => {
+  await setDoc(`<p style="${P}"><br></p>`);
+  await caretIn('p');
+  await paste({ text: '<p style="margin:0;">Ett</p><br><p style="margin:0;">Pris: 10&nbsp;000&nbsp;kr, <a href="https://exa\nmple.com">länk</a></p><pre>rad 1\nrad 2</pre>' });
+  eq(await out(), '<p style="margin:0;">Ett</p><p style="margin:0;">&nbsp;</p><p style="margin:0;">Pris: 10&nbsp;000&nbsp;kr, <a href="https://example.com">länk</a></p><div>rad 1<br>rad 2</div>');
+});
+await test('styles still update after a "Redigera HTML" round trip', async () => {
+  await setDoc(`<p style="${P}">A</p><p style="${P}">Slut</p>`);
+  await caret('A'); await page.selectOption('#sel-block', 'h-sub');
+  await page.click('#code-edit'); await page.click('#code-apply');
+  await page.click('.preset[data-id="h-sub"] .preset-edit');
+  await page.fill('#se-css', 'margin: 0 0 6px 0;\nfont-size: 18px;');
+  await page.click('.modal-foot .mbtn.primary');
+  eq(await out(), `<div style="margin:0 0 6px 0;font-size:18px;">A</div><p style="${P0}">Slut</p>`);
+});
+
+await test('real mouse triple-click on a heading, then paste, replaces the text cleanly', async () => {
+  await setDoc(`<p style="${P}">Före</p><div style="${H}">Gammal rubrik</div><p style="${P}">Brödtext här.</p>`);
+  const b = await page.evaluate(() => { const t = document.querySelector('#editor div').firstChild; const r = document.createRange(); r.selectNodeContents(t); const x = r.getBoundingClientRect(); return { x: x.left + 5, y: x.top + x.height / 2 }; });
+  await page.mouse.click(b.x, b.y, { clickCount: 3 });
+  await paste({ text: 'Ny rubrik' });
+  eq(await out(), `<p style="${P}">Före</p><div style="${H}">Ny rubrik</div><p style="${P0}">Brödtext här.</p>`);
+});
+await test('bold on a word in a bold heading turns it off without touching the heading style', async () => {
+  await setDoc(`<div style="${H}">Min rubrik</div><p style="${P}">Slut</p>`);
+  await select('rubrik');
+  await page.click('[data-cmd="bold"]');
+  eq(await out(), `<div style="${H}">Min <span style="font-weight:400;">rubrik</span></div><p style="${P0}">Slut</p>`);
+  await select('rubrik');
+  await page.click('[data-cmd="bold"]');
+  eq(await out(), `<div style="${H}">Min rubrik</div><p style="${P0}">Slut</p>`, 'toggled back on');
+});
+await test('bold off on part of a bold word splits the <b>', async () => {
+  await setDoc(`<p style="${P}"><b>abcdef</b></p><p style="${P}">Slut</p>`);
+  await select('abcdef', 'abcdef', 2, 4);
+  await key('Control+b');
+  eq(await out(), `<p style="${P}"><b>ab</b>cd<b>ef</b></p><p style="${P0}">Slut</p>`);
+});
+await test('"Redigera HTML" does not bake the last-element margin into a box', async () => {
+  await setDoc(`<p style="${P}">Före</p><div style="margin:0 0 14px 0;padding:12px;" data-preset="box-info"><p style="${P}">I rutan</p></div>`);
+  await page.click('#code-edit');
+  ok((await page.$eval('#code-textarea', t => t.value)).includes('margin:0 0 14px 0;padding:12px;'), 'edit view shows the stored box margin');
+  await page.click('#code-apply');
+  await page.evaluate(() => { const ed = document.getElementById('editor'); const p = ed.lastElementChild; const r = document.createRange(); r.setStart(p, 0); ed.focus(); getSelection().removeAllRanges(); getSelection().addRange(r); });
+  await type('Efter');
+  eq(await out(), `<p style="${P}">Före</p><div style="margin:0 0 14px 0;padding:12px;"><p style="${P0}">I rutan</p></div><p style="${P0}">Efter</p>`);
+});
+await test('Enter at the start of a table at the top of the document adds a paragraph above', async () => {
+  await setDoc(`<table style="border-collapse:collapse;"><tbody><tr><td style="padding:4px;">A1</td></tr></tbody></table><p style="${P}">Slut</p>`);
+  await caret('A1', 0);
+  await key('Enter'); await type('Ovan');
+  eq(await out(), `<p style="${P}">Ovan</p><table style="border-collapse:collapse;"><tr><td style="padding:4px;">A1</td></tr></table><p style="${P0}">Slut</p>`);
+});
+await test('a sub list pulled up to the top level gets the normal list style', async () => {
+  await setDoc(`<p style="${P}">Före</p><ul style="${UL}"><li style="${LI}">Ett<ul style="margin:6px 0 0 0;padding-left:20px;"><li style="${LI}">Sub</li></ul></li></ul><p style="${P}">Slut</p>`);
+  await caret('Före', 4);
+  await key('Delete');
+  eq(await out(), `<p style="${P}">FöreEtt</p><ul style="${UL}"><li style="${P0}">Sub</li></ul><p style="${P0}">Slut</p>`);
+});
+
 console.log('\nUndo, persistence, v1 migration');
 await test('undo and redo restore the document', async () => {
   await setDoc(`<p style="${P}">Ett</p><p style="${P}">Slut</p>`);

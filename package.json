@@ -1,0 +1,12 @@
+{
+  "name": "mini-html-editor",
+  "version": "2.0.0",
+  "private": true,
+  "description": "WYSIWYG-editor som ger kompakt HTML med inline-CSS att klistra in i andra system.",
+  "scripts": {
+    "test": "node tests/editor.test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1"
+  }
+}
